@@ -10,3 +10,4 @@ httpx
 google-generativeai
 faker
 psycopg2-binary
+email-validator
