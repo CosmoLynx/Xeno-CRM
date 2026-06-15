@@ -7,7 +7,14 @@ from sqlalchemy.orm import declarative_base
 
 from app.config import DATABASE_URL
 
-engine = create_async_engine(DATABASE_URL, echo=False, future=True)
+# Supabase's transaction pooler (PgBouncer) doesn't support prepared statements,
+# so asyncpg's statement cache must be disabled when connecting through the pooler.
+engine = create_async_engine(
+    DATABASE_URL,
+    echo=False,
+    future=True,
+    connect_args={"statement_cache_size": 0},
+)
 
 AsyncSessionLocal = async_sessionmaker(
     engine,
