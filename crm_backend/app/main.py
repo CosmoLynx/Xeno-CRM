@@ -5,13 +5,17 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
+from app.config import GEMINI_MODEL
 from app.database import init_db
+from app.services.ai_service import is_gemini_configured
 from app.routers import ai, campaigns, customers, orders, segments, webhook
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Run startup and shutdown hooks for the application."""
+    ai_status = "configured" if is_gemini_configured() else "MISSING — set GEMINI_API_KEY on Render"
+    print(f"[STARTUP] Gemini AI: {ai_status} (model={GEMINI_MODEL})")
     await init_db()
     yield
 
@@ -44,4 +48,11 @@ app.include_router(ai.router)
 @app.get("/health")
 async def health_check():
     """Lightweight liveness probe for load balancers and local dev."""
-    return {"status": "ok", "service": "xeno-crm"}
+    return {
+        "status": "ok",
+        "service": "xeno-crm",
+        "ai": {
+            "configured": is_gemini_configured(),
+            "model": GEMINI_MODEL,
+        },
+    }

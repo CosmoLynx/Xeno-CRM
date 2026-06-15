@@ -19,7 +19,7 @@ if "@host:port/" in DATABASE_URL or DATABASE_URL.rstrip("/").endswith(":port"):
         "Update crm_backend/.env with your real Supabase connection string and save the file."
     )
 
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash").strip()
 CHANNEL_STUB_URL = os.getenv("CHANNEL_STUB_URL", "http://localhost:8001")
 CRM_BASE_URL = os.getenv("CRM_BASE_URL", "http://localhost:8000")

@@ -23,8 +23,10 @@ from app.schemas.ai import (
     ChannelPerformance,
 )
 
-genai.configure(api_key=GEMINI_API_KEY)
-_model = genai.GenerativeModel(GEMINI_MODEL)
+# Render web services time out around 30s — stay under that for Gemini calls.
+GEMINI_REQUEST_TIMEOUT_SECONDS = 25.0
+
+_model: genai.GenerativeModel | None = None
 
 SEGMENT_PROMPT_TEMPLATE = """You are a CRM segmentation assistant. Convert the user's \
 natural language description into a JSON object for filtering customers.
@@ -119,6 +121,11 @@ class AIServiceError(Exception):
     """Raised when the AI service fails or returns unusable output."""
 
 
+def is_gemini_configured() -> bool:
+    """Return True when a non-placeholder Gemini API key is present."""
+    return bool(GEMINI_API_KEY and GEMINI_API_KEY != "your_gemini_api_key_here")
+
+
 def extract_json_from_response(text: str) -> dict:
     """Parse JSON from a Gemini response, stripping markdown fences if present.
 
@@ -154,31 +161,99 @@ def extract_json_from_response(text: str) -> dict:
 
 
 def _ensure_api_key() -> None:
-    if not GEMINI_API_KEY or GEMINI_API_KEY == "your_gemini_api_key_here":
+    if not is_gemini_configured():
         raise AIServiceError(
-            "GEMINI_API_KEY is not configured. Set a valid key in crm_backend/.env"
+            "GEMINI_API_KEY is not configured. Add it as an environment variable on Render "
+            "(Dashboard → your service → Environment)."
         )
+
+
+def _get_model() -> genai.GenerativeModel:
+    """Lazy-init Gemini client so the app boots even if the key is missing."""
+    global _model
+    if _model is None:
+        _ensure_api_key()
+        genai.configure(api_key=GEMINI_API_KEY)
+        _model = genai.GenerativeModel(GEMINI_MODEL)
+    return _model
+
+
+def _extract_response_text(response) -> str:
+    """Return model text, handling safety blocks and empty candidates."""
+    try:
+        text = response.text
+        if text and text.strip():
+            return text.strip()
+    except (ValueError, AttributeError):
+        pass
+
+    candidates = getattr(response, "candidates", None) or []
+    if candidates:
+        parts = []
+        for part in candidates[0].content.parts:
+            part_text = getattr(part, "text", None)
+            if part_text:
+                parts.append(part_text)
+        if parts:
+            return "".join(parts).strip()
+
+    prompt_feedback = getattr(response, "prompt_feedback", None)
+    block_reason = getattr(prompt_feedback, "block_reason", None)
+    if block_reason:
+        raise AIServiceError(
+            f"Gemini blocked the request (reason: {block_reason}). Try rephrasing your input."
+        )
+
+    raise AIServiceError("Gemini returned an empty response")
+
+
+async def _call_gemini(prompt: str) -> str:
+    """Run a Gemini generate_content call with timeout and clearer errors."""
+    model = _get_model()
+    timeout = int(GEMINI_REQUEST_TIMEOUT_SECONDS)
+
+    try:
+        response = await asyncio.wait_for(
+            asyncio.to_thread(
+                model.generate_content,
+                prompt,
+                request_options={"timeout": timeout},
+            ),
+            timeout=GEMINI_REQUEST_TIMEOUT_SECONDS + 5,
+        )
+    except asyncio.TimeoutError as exc:
+        raise AIServiceError(
+            "Gemini request timed out (~25s). Render web services limit requests to ~30s — "
+            "try again with a shorter prompt."
+        ) from exc
+    except Exception as exc:
+        message = str(exc).lower()
+        if "404" in message or "not found" in message:
+            raise AIServiceError(
+                f"Gemini model '{GEMINI_MODEL}' not found. Set GEMINI_MODEL on Render "
+                f"(try gemini-2.0-flash or gemini-2.5-flash). Detail: {exc}"
+            ) from exc
+        if any(token in message for token in ("api key", "api_key", "401", "403", "permission")):
+            raise AIServiceError(
+                "Gemini rejected the API key. Verify GEMINI_API_KEY on Render matches your "
+                f"Google AI Studio key. Detail: {exc}"
+            ) from exc
+        raise AIServiceError(f"Gemini API error: {exc}") from exc
+
+    return _extract_response_text(response)
 
 
 async def generate_segment_conditions(description: str) -> AISegmentResponse:
     """Convert natural language into validated ``SegmentConditions`` via Gemini."""
-    _ensure_api_key()
     prompt = SEGMENT_PROMPT_TEMPLATE.format(description=description)
 
     try:
-        response = await asyncio.to_thread(_model.generate_content, prompt)
-    except Exception as exc:
-        raise AIServiceError(f"Gemini API error while generating segment: {exc}") from exc
-
-    if not response.text:
-        raise AIServiceError("Gemini returned an empty response for segment generation")
-
-    try:
-        parsed = extract_json_from_response(response.text)
+        text = await _call_gemini(prompt)
+        parsed = extract_json_from_response(text)
         return AISegmentResponse.model_validate(parsed)
     except ValidationError as exc:
         raise AIServiceError(
-            f"AI returned invalid segment conditions. Raw response: {response.text!r}. "
+            f"AI returned invalid segment conditions. Raw response: {text!r}. "
             f"Validation errors: {exc}"
         ) from exc
     except ValueError as exc:
@@ -187,7 +262,6 @@ async def generate_segment_conditions(description: str) -> AISegmentResponse:
 
 async def generate_campaign_message(request: AIMessageRequest) -> AIMessageResponse:
     """Generate a personalized campaign message template via Gemini."""
-    _ensure_api_key()
     prompt = MESSAGE_PROMPT_TEMPLATE.format(
         goal=request.goal,
         segment_description=request.segment_description or "general audience",
@@ -195,15 +269,7 @@ async def generate_campaign_message(request: AIMessageRequest) -> AIMessageRespo
         tone=request.tone or "friendly",
     )
 
-    try:
-        response = await asyncio.to_thread(_model.generate_content, prompt)
-    except Exception as exc:
-        raise AIServiceError(f"Gemini API error while generating message: {exc}") from exc
-
-    if not response.text:
-        raise AIServiceError("Gemini returned an empty response for message generation")
-
-    message = response.text.strip().strip('"').strip("'")
+    message = (await _call_gemini(prompt)).strip().strip('"').strip("'")
     return AIMessageResponse(message=message, character_count=len(message))
 
 
@@ -294,8 +360,6 @@ async def generate_campaign_suggestions(
     performance_stats: list[ChannelPerformance],
 ) -> CampaignSuggestionsResponse:
     """Generate data-informed campaign strategy suggestions for a segment."""
-    _ensure_api_key()
-
     prompt = SUGGESTIONS_PROMPT_TEMPLATE.format(
         segment_name=segment.name,
         segment_description=segment.description or "No description",
@@ -305,17 +369,8 @@ async def generate_campaign_suggestions(
     )
 
     try:
-        response = await asyncio.to_thread(_model.generate_content, prompt)
-    except Exception as exc:
-        raise AIServiceError(
-            f"Gemini API error while generating campaign suggestions: {exc}"
-        ) from exc
-
-    if not response.text:
-        raise AIServiceError("Gemini returned an empty response for campaign suggestions")
-
-    try:
-        parsed = extract_json_from_response(response.text)
+        text = await _call_gemini(prompt)
+        parsed = extract_json_from_response(text)
         suggestions = [
             _sanitize_suggestion(item)
             for item in parsed.get("suggestions", [])
