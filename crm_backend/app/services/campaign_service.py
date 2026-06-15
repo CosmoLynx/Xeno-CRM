@@ -93,29 +93,52 @@ def personalize_message(template: str, customer: Customer) -> str:
 
 
 async def send_to_channel_stub(payload: dict) -> None:
-    """POST a single message payload to the channel stub for async simulated delivery.
+    """POST a single message payload to the channel stub, with retries for transient failures.
 
     Accepts a plain dict only — no ORM objects — so this can safely run
     as a background task after the database session has closed.
+
+    Free-tier hosting (Render) puts idle services to sleep, causing transient
+    502/connection errors on the first request after inactivity. Retrying with
+    backoff handles this gracefully — this mirrors real-world transient network
+    failure handling for unreliable downstream services.
     """
     message_id = payload.get("messageId", "unknown")
     recipient_name = payload.get("recipient", {}).get("name", "unknown")
 
-    try:
-        async with httpx.AsyncClient() as client:
-            response = await client.post(
-                f"{CHANNEL_STUB_URL}/send",
-                json=payload,
-                timeout=CHANNEL_STUB_TIMEOUT_SECONDS,
+    max_retries = 3
+    base_delay = 2  # seconds
+
+    for attempt in range(1, max_retries + 1):
+        try:
+            async with httpx.AsyncClient() as client:
+                response = await client.post(
+                    f"{CHANNEL_STUB_URL}/send",
+                    json=payload,
+                    timeout=CHANNEL_STUB_TIMEOUT_SECONDS,
+                )
+                response.raise_for_status()
+            print(
+                f"[CAMPAIGN] Sent message {message_id} to channel "
+                f"stub for {recipient_name} (attempt {attempt})"
             )
-            response.raise_for_status()
-        print(
-            f"[CAMPAIGN] Sent message {message_id} to channel stub for {recipient_name}"
-        )
-    except Exception as exc:
-        print(
-            f"[CAMPAIGN] Failed to send message {message_id} to channel stub: {exc}"
-        )
+            return
+
+        except Exception as exc:
+            is_last_attempt = attempt == max_retries
+            print(
+                f"[CAMPAIGN] Attempt {attempt}/{max_retries} failed "
+                f"for message {message_id}: {exc}"
+            )
+            if is_last_attempt:
+                print(
+                    f"[CAMPAIGN] Giving up on message {message_id} "
+                    f"after {max_retries} attempts"
+                )
+                return
+
+            delay = base_delay * (2 ** (attempt - 1))
+            await asyncio.sleep(delay)
 
 
 async def launch_campaign(campaign_id: uuid.UUID, db: AsyncSession) -> Campaign:
